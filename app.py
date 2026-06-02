@@ -9,14 +9,25 @@ import re
 # ==========================================
 
 def resolve_column(columns, exact_target, fallback_keywords):
-    """Intelligently finds a column in the DataFrame."""
+    """Intelligently finds a column, prioritizing exact matches and shorter names."""
     if exact_target in columns:
         return exact_target
     
+    clean_target = " ".join(exact_target.lower().split())
     for col in columns:
-        if all(kw.lower() in str(col).lower() for kw in fallback_keywords):
+        if " ".join(str(col).lower().split()) == clean_target:
             return col
             
+    # Fallback keyword match - prioritize the shortest matching column name
+    # This prevents grabbing "Prompt only Throughput" when we want "Throughput"
+    matches = []
+    for col in columns:
+        if all(kw.lower() in str(col).lower() for kw in fallback_keywords):
+            matches.append(col)
+            
+    if matches:
+        return min(matches, key=len) # Returns the most direct match
+        
     return columns[-1] if len(columns) > 0 else exact_target
 
 # ==========================================
@@ -97,36 +108,49 @@ def update_customer_analytics(df, selected_models, target_input, target_output):
     gen_col = resolve_column(filtered.columns, "Gen Speed (t/s/user)", ["gen", "speed"])
     rpm_col = resolve_column(filtered.columns, "RPM", ["rpm"])
 
+    # Helper to safely convert Excel string-numbers (like "1,200.5") into floats
+    def safe_numeric(series):
+        return pd.to_numeric(series.astype(str).str.replace(',', ''), errors='coerce')
+
+    # Filter for workload parameters
     if input_col in filtered.columns and output_col in filtered.columns:
         exact_match = filtered[
-            (pd.to_numeric(filtered[input_col], errors='coerce').fillna(0) >= target_input) & 
-            (pd.to_numeric(filtered[output_col], errors='coerce').fillna(0) >= target_output)
+            (safe_numeric(filtered[input_col]).fillna(0) >= target_input) & 
+            (safe_numeric(filtered[output_col]).fillna(0) >= target_output)
         ]
         if not exact_match.empty:
             filtered = exact_match
+        else:
+            # Better UX: Tells the user if their slider settings are too high for the dataset
+            return f"### ⚠️ No models match these constraints\nNone of the selected sweeps contain data for an Input Length >= **{target_input}** and Output Length >= **{target_output}**. Try lowering the context sliders.", None, None
 
     summary_data = []
     for model in selected_models:
-        # Create a clean copy to avoid SettingWithCopyWarning
         m_df = filtered[filtered["Model_ID"] == model].copy()
         if m_df.empty:
             continue
             
-        m_df[tp_col] = pd.to_numeric(m_df[tp_col], errors='coerce')
+        m_df[tp_col] = safe_numeric(m_df[tp_col])
         
-        # FIX: Check if the column is entirely NaN before trying to find the max index
         if m_df[tp_col].isna().all():
             continue 
             
         best_idx = m_df[tp_col].idxmax()
         best_row = m_df.loc[best_idx]
         
+        def get_val(col_name):
+            val = best_row.get(col_name, 0)
+            try:
+                return float(str(val).replace(',', ''))
+            except (ValueError, TypeError):
+                return 0.0
+                
         summary_data.append({
             "Model": model,
-            "Max Total Throughput (t/s)": best_row.get(tp_col, 0),
-            "Optimal TTFT (ms)": best_row.get(ttft_col, 0),
-            "User Gen Speed (t/s)": best_row.get(gen_col, 0),
-            "Requests/Min (RPM)": best_row.get(rpm_col, 0)
+            "Max Total Throughput (t/s)": get_val(tp_col),
+            "Optimal TTFT (ms)": get_val(ttft_col),
+            "User Gen Speed (t/s)": get_val(gen_col),
+            "Requests/Min (RPM)": get_val(rpm_col)
         })
         
     summary_df = pd.DataFrame(summary_data)
@@ -154,16 +178,18 @@ def update_engineer_analytics(df, selected_models):
     if df.empty or not selected_models:
         return pd.DataFrame(), None, None
         
-    # Use .copy() to prevent SettingWithCopyWarnings when modifying dtypes
     filtered = df[df["Model_ID"].isin(selected_models)].copy()
     
     batch_col = resolve_column(filtered.columns, "Batch Size", ["batch"])
     tp_col = resolve_column(filtered.columns, "Throughput (t/s)", ["throughput", "t/s"])
     hardware_col = resolve_column(filtered.columns, "Throughput / box (t/s/hardware)", ["box", "hardware"])
     
+    def safe_numeric(series):
+        return pd.to_numeric(series.astype(str).str.replace(',', ''), errors='coerce')
+    
     for col in [batch_col, tp_col, hardware_col]:
         if col in filtered.columns:
-            filtered[col] = pd.to_numeric(filtered[col], errors='coerce')
+            filtered[col] = safe_numeric(filtered[col])
 
     scaling_plot = gr.LinePlot(
         filtered, x=batch_col, y=tp_col, color="Model_ID",
