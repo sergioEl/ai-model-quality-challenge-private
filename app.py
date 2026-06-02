@@ -35,14 +35,29 @@ def resolve_column(columns, exact_target, fallback_keywords):
 # ==========================================
 
 def parse_perf_sweep(file_path):
-    """Parses a single Excel performance sweep dynamically."""
+    """
+    Parses a single Excel performance sweep dynamically.
+    Automatically hunts for the true header row to bypass metadata/summaries.
+    """
     try:
-        df = pd.read_excel(file_path)
+        # 1. Read the raw file without assuming row 0 is the header
+        temp_df = pd.read_excel(file_path, header=None)
         
-        # Hardened Whitespace Normalization
+        # 2. Hunt for the real header row by looking for standard perf keywords
+        header_idx = 0
+        for i, row in temp_df.iterrows():
+            row_text = " ".join(str(val).lower() for val in row.values)
+            if "throughput" in row_text or "input length" in row_text or "batch size" in row_text:
+                header_idx = i
+                break
+                
+        # 3. Re-read the dataframe using the correct starting row
+        df = pd.read_excel(file_path, header=header_idx)
+        
+        # 4. Hardened Whitespace Normalization
         df.columns = [" ".join(str(col).split()) for col in df.columns]
         
-        # Dynamic model resolution from filename
+        # 5. Dynamic model resolution from filename
         base_name = os.path.basename(file_path)
         match = re.match(r"([A-Za-z0-9_-]+)_profile", base_name)
         if not match:
