@@ -113,6 +113,7 @@ def update_customer_analytics(df, selected_models, target_input, target_output):
         return pd.to_numeric(series.astype(str).str.replace(',', ''), errors='coerce')
 
     # Filter for workload parameters
+    warning_message = ""
     if input_col in filtered.columns and output_col in filtered.columns:
         exact_match = filtered[
             (safe_numeric(filtered[input_col]).fillna(0) >= target_input) & 
@@ -121,8 +122,9 @@ def update_customer_analytics(df, selected_models, target_input, target_output):
         if not exact_match.empty:
             filtered = exact_match
         else:
-            # Better UX: Tells the user if their slider settings are too high for the dataset
-            return f"### ⚠️ No models match these constraints\nNone of the selected sweeps contain data for an Input Length >= **{target_input}** and Output Length >= **{target_output}**. Try lowering the context sliders.", None, None
+            # FALLBACK FIX: Instead of returning an error and hiding the data, 
+            # we just warn the user and show them the highest data available.
+            warning_message = f"*(⚠️ Note: The selected models do not contain test data reaching {target_input} Input / {target_output} Output. Showing highest available performance instead.)*\n\n"
 
     summary_data = []
     for model in selected_models:
@@ -157,7 +159,7 @@ def update_customer_analytics(df, selected_models, target_input, target_output):
     if summary_df.empty:
         return "No numeric performance match found for the selected parameters.", None, None
         
-    verdict = "### 📋 Workload Sizing Insights\n"
+    verdict = f"### 📋 Workload Sizing Insights\n{warning_message}"
     for _, row in summary_df.iterrows():
         verdict += f"- **{row['Model']}**: Delivers a peak generation performance of **{row['User Gen Speed (t/s)']:.1f} t/s per user** with a Time-to-First-Token latency of **{row['Optimal TTFT (ms)']:.1f} ms**. Sustains up to **{row['Requests/Min (RPM)']} RPM**.\n"
 
