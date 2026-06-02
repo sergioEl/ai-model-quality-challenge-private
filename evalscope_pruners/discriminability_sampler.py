@@ -1,14 +1,18 @@
-"""DiscriminabilitySampler: Part A - Prune LCB v5 / AA-LCR.
+"""DiscriminabilitySampler: Part A -- Prune LCB v5 / AA-LCR.
 
-Selection criterion: approximate Leave-One-Out discriminative value.
-A sample is useful if it has one model clearly correct while another is clearly wrong.
-Keeps samples where model scores are polarized and one score is high near 1.
+Fixes from code review:
+  1. Match-count stratification: group by exact # models passing (0/1/2/3),
+     not continuous ranges that collapse to empty buckets with 3 binary models.
+  2. Metadata tie-breaking: use judge reasoning length, generation length,
+     and failure-mode diversity instead of variance (identical for all samples
+     in 1-pass and 2-pass strata with binary scores).
+  3. No random fallback: all selection is deterministic from embedded metadata.
 """
-
 import json
 import os
+from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 from evalscope.collections import Sampler
@@ -16,12 +20,16 @@ from evalscope.collections import Sampler
 
 class DiscriminabilitySampler(Sampler):
     """
-    Prune LCB v5 / AA-LCR to a small, informative subset.
+    Prune LCB v5 and/or AA-LCR into a minimal, informative probe set.
 
-    Uses an approximate discriminative-value objective:
-      score_i = max(|s_a - s_b|, |s_b - s_c|, |s_a - s_c|)
-      reward_i = score_i * max(s_a, s_b, s_c)
-    This favors samples where models disagree AND at least one performs well.
+    Stratification: With 3 models producing binary {0,1} scores, each sample
+    has a match count in {0,1,2,3}. We allocate probe slots across these
+    strata proportionally, guaranteeing coverage of the full difficulty range.
+
+    Tie-breaking within strata uses embedded metadata:
+      - LCB: generation length + failure-mode categorization (timeout/syntax/runtime)
+      - AA-LCR: judge reasoning length + judge confidence (LLM judge non-determinism)
+    This is orthogonal to model scores and works for any model ensemble.
     """
 
     def __init__(
@@ -29,270 +37,205 @@ class DiscriminabilitySampler(Sampler):
         data_path: Optional[str] = None,
         results_dir: Optional[str] = None,
         target_size: int = 300,
-        results_prefix: str = "results/evalscope_run",
-        benchmark_builds: str = "jsonl",
         seed: int = 42,
     ):
         super().__init__()
         self.data_path = data_path
         self.results_dir = results_dir
         self.target_size = max(50, int(target_size))
-        self.results_prefix = results_prefix
-        self.benchmark_builds = benchmark_builds
         self.seed = seed
+        np.random.seed(seed)
+        self._model_scores: Dict[str, Dict[str, float]] = {}
+        self._model_names: List[str] = []
 
-    def _load_jsonl_items(self, filepath: str) -> List[dict]:
-        filepath = os.path.abspath(filepath)
-        with open(filepath, "r", encoding="utf-8") as fp:
-            lines = [line.strip() for line in fp]
+    # === Data Loading ===
+
+    def _load_jsonl(self, filepath: str) -> List[Dict[str, Any]]:
         items = []
-        for line in lines:
-            if not line:
-                continue
-            items.append(json.loads(line))
+        filepath = os.path.abspath(filepath)
+        if not os.path.exists(filepath):
+            return items
+        with open(filepath, "r", encoding="utf-8") as fp:
+            for line in fp:
+                line = line.strip()
+                if line:
+                    items.append(json.loads(line))
         return items
 
-    def _load_sample_rows(self, build_tokens: str) -> List[dict]:
-        rows: List[dict] = []
-        tokens = [tok.strip() for tok in build_tokens.split(",") if tok.strip()]
-        for tok in tokens:
-            base_path = Path(tok)
-            if base_path.is_dir():
-                file_dir = base_path
-            else:
-                file_dir = base_path.parent
-                if not file_dir.exists():
-                    file_dir = Path(".")
-            for jsonl_path in file_dir.glob("*.jsonl"):
-                items = self._load_jsonl_items(str(jsonl_path))
-                for item in items:
-                    sample = item.get("sample") or item
-                    sample["_data_parent"] = tok
-                    rows.append(sample)
-        return rows
+    def _load_predictions(self) -> List[Dict[str, Any]]:
+        if not self.data_path:
+            return []
+        paths = [p.strip() for p in self.data_path.split(",") if p.strip()]
+        items: List[Dict[str, Any]] = []
+        for p in paths:
+            path = Path(p)
+            if path.is_file():
+                items.extend(self._load_jsonl(str(path)))
+            elif path.is_dir():
+                for jsonl in sorted(path.glob("*.jsonl")):
+                    items.extend(self._load_jsonl(str(jsonl)))
+        return items
 
-    def _load_model_scores(
-        self, items: Sequence[dict]
-    ) -> Tuple[List[Dict[str, float]], Dict[str, str]]:
-        if self.data_path and os.path.exists(self.data_path):
-            with open(self.data_path, "r", encoding="utf-8") as fp:
-                data = json.load(fp)
-            model_scores: List[Dict[str, float]] = data.get("model_scores", [])
-            model_model: Dict[str, str] = data.get("model_model", {})
-        else:
-            model_scores = []
-            model_model = {}
-        if self.results_dir and os.path.exists(self.results_dir):
-            results: Dict[str, Dict[str, float]] = {}
-            for entry in os.listdir(self.results_dir):
-                full_entry = os.path.join(self.results_dir, entry)
-                if not os.path.isdir(full_entry):
+    def _load_model_scores(self) -> None:
+        if not self.results_dir or not os.path.isdir(self.results_dir):
+            return
+        for model_dir in os.listdir(self.results_dir):
+            model_path = os.path.join(self.results_dir, model_dir)
+            if not os.path.isdir(model_path):
+                continue
+            for subdir in os.listdir(model_path):
+                sub_path = os.path.join(model_path, subdir)
+                if not os.path.isdir(sub_path):
                     continue
-                for tag in os.listdir(full_entry):
-                    full_tag = os.path.join(full_entry, tag)
-                    if not os.path.isdir(full_tag):
-                        continue
-                    eval_dir = os.path.join(full_tag, "eval")
-                    if not os.path.isdir(eval_dir):
-                        continue
-                    answers_json = os.path.join(eval_dir, "answers.json")
-                    if not os.path.exists(answers_json):
-                        continue
-                    with open(answers_json, "r", encoding="utf-8") as fp:
+                eval_path = os.path.join(sub_path, "eval")
+                if not os.path.isdir(eval_path):
+                    continue
+                answers_file = os.path.join(eval_path, "answers.json")
+                if os.path.exists(answers_file):
+                    with open(answers_file, "r", encoding="utf-8") as fp:
                         answers = json.load(fp)
-                    per_rev: Dict[str, Dict[str, float]] = {}
                     for ans in answers:
                         model_name = str(ans.get("model_name", ans.get("model", "")))
-                        prediction = ans.get("prediction", "")
-                        answer_str = ans.get("answer", "")
-                        if prediction is None:
-                            prediction = ""
-                        if answer_str is None:
-                            answer_str = ""
-                        rev_id = str(ans.get("choice", ans.get("review_id", "")))
-                        pred_score = 1.0 if str(prediction) == str(answer_str) else 0.0
-                        if model_name not in per_rev:
-                            per_rev[model_name] = {}
-                        per_rev[model_name][rev_id] = float(pred_score)
-                    results[tag] = per_rev
-            if results:
-                all_models = set()
-                for per_rev in results.values():
-                    all_models.update(per_rev.keys())
-                merged: Dict[str, Dict[str, float]] = {}
-                for model_name in all_models:
-                    merged[model_name] = {}
-                for per_rev in results.values():
-                    for model_name, rev_dict in per_rev.items():
-                        for rev_id, score in rev_dict.items():
-                            existing = merged.get(model_name, {}).get(rev_id)
-                            if existing is not None:
-                                merged[model_name][rev_id] = existing + score
-                            else:
-                                merged[model_name][rev_id] = score
-                for model_name in all_models:
-                    rev_dict = merged.get(model_name, {})
-                    for k, v in rev_dict.items():
-                        rev_dict[k] = max(0.0, min(1.0, v))
-                json_obj: Dict[str, Any] = {}
-                json_obj["model_model"] = model_model
-                json_obj["model_scores"] = []
-                for model_name, rev_dict in merged.items():
-                    ScoreEntry = {"model": model_name, "scores": rev_dict}
-                    json_obj["model_scores"].append(ScoreEntry)
-                self.data_path = None
-                return self._load_model_scores([])
-        if model_scores:
-            merged = {}
-            for entry in model_scores:
-                model_name = entry.get("model", entry.get("model_name", ""))
-                scores = entry.get("scores", {})
-                if model_name not in merged:
-                    merged[model_name] = {}
-                for k, v in scores.items():
-                    merged[model_name][k] = float(v)
-            return list(merged.values()), model_model
-        return [], {}
+                        idx_key = str(ans.get("index", ans.get("choice", "")))
+                        pred = ans.get("prediction", "")
+                        gold = ans.get("answer", ans.get("gold", ""))
+                        score = 1.0 if str(pred) == str(gold) else 0.0
+                        if model_name not in self._model_scores:
+                            self._model_scores[model_name] = {}
+                        self._model_scores[model_name][idx_key] = score
+        self._model_names = sorted(self._model_scores.keys())
 
-    def _pairwise_score_matrix(self, items: Sequence[dict]) -> np.ndarray:
-        n = len(items)
-        S = np.zeros((n, n), dtype=np.float32)
-        for i, item in enumerate(items):
-            model_answer = item.get("model_answer") or item.get("answer", "")
-            for j, other in enumerate(items):
-                if i == j:
-                    continue
-                other_answer = other.get("model_answer") or other.get("answer", "")
-                if str(model_answer) == str(other_answer):
-                    S[i, j] = 1.0
-                else:
-                    S[i, j] = 0.0
-        return S
+    # === Metadata Extraction ===
 
-    def _build_data_table(
-        self, items: Sequence[dict]
-    ) -> Tuple[List[dict], List[int], Dict[str, int]]:
-        index_map: Dict[int, int] = {}
-        data_rows: List[dict] = []
-        used: Dict[str, int] = {}
-        for orig_idx, item in enumerate(items):
-            revision_id = str(item.get("choice", item.get("review_id", "")))
-            content = item.get("query", item.get("input", item.get("text", "")))
-            model_answer = item.get("model_answer") or item.get("answer", "")
-            data_rows.append({"content": content, "model_answer": model_answer})
-            used[revision_id] = orig_idx
-            index_map[orig_idx] = len(data_rows) - 1
-        return data_rows, [index_map[i] for i in range(len(items))], used
+    def _lcb_meta(self, item: Dict[str, Any]) -> Dict[str, float]:
+        pred = item.get("prediction", "") or item.get("response", "")
+        meta = {"gen_length": float(len(str(pred)))}
+        exec_info = item.get("execution", item.get("exec_result", item.get("stdout", {})))
+        if isinstance(exec_info, dict):
+            err = exec_info.get("error_type", exec_info.get("error", exec_info.get("status", "none")))
+        else:
+            err = str(exec_info)
+        if "timeout" in err.lower() or err in ("TLE", "time_limit_exceeded"):
+            meta["failure_timeout"] = 1.0
+            meta["failure_syntax"] = 0.0
+        elif "syntax" in err.lower() or "parse" in err.lower():
+            meta["failure_timeout"] = 0.0
+            meta["failure_syntax"] = 1.0
+        else:
+            meta["failure_timeout"] = 0.0
+            meta["failure_syntax"] = 0.0
+        return meta
 
-    def _discriminative_values(
-        self, items: Sequence[dict], score_matrix: np.ndarray
-    ) -> np.ndarray:
-        n = len(items)
-        scores = np.zeros(n, dtype=np.float32)
-        for i in range(n):
-            max_gap = 0.0
-            max_acc = 0.0
-            for j in range(i + 1, n):
-                gap = abs(score_matrix[i, j] - 0.5)
-                if score_matrix[i, j] > 0.5:
-                    candidate = min(1.0, score_matrix[i, j])
-                else:
-                    candidate = 0.0
-                acc = max(score_matrix[i, j], candidate)
-                if gap > max_gap or (gap == max_gap and acc > max_acc):
-                    max_gap = gap
-                    max_acc = acc
-            if max_gap > 0:
-                scores[i] = max_gap * max_acc
-            else:
-                scores[i] = 0.0
-        return scores
+    def _aalcr_meta(self, item: Dict[str, Any]) -> Dict[str, float]:
+        review = item.get("review", {})
+        if isinstance(review, dict):
+            reasoning = review.get("reasoning", review.get("explanation", ""))
+            conf = review.get("confidence", 0.5)
+        elif isinstance(review, str):
+            reasoning = review
+            conf = 0.5
+        else:
+            reasoning = ""
+            conf = 0.5
+        score_dict = item.get("sample_score", item.get("score", {}))
+        if isinstance(score_dict, dict):
+            conf = score_dict.get("confidence", conf)
+        return {
+            "judge_reasoning_len": float(len(str(reasoning))),
+            "judge_confidence": float(conf),
+            "judge_logprob": float(score_dict.get("logprob", -1.0) if isinstance(score_dict, dict) else -1.0),
+        }
 
-    def fit(self, items: Sequence[dict], **kwargs) -> "DiscriminabilitySampler":
-        if not items:
-            raise ValueError("DiscriminabilitySampler.fit received 0 items.")
-        score_rows, model_model = self._load_model_scores(items)
-        self._score_rows = score_rows
-        self._model_model = model_model
+    def _generic_meta(self, item: Dict[str, Any]) -> Dict[str, float]:
+        pred = item.get("prediction", item.get("response", ""))
+        return {"gen_length": float(len(str(pred)))}
+
+    # === Match-Count Stratification ===
+
+    def _match_counts(
+        self, items: List[Dict[str, Any]]
+    ) -> List[Tuple[int, List[float], int]]:
+        """
+        Compute (match_count, per_model_scores, idx) for each sample.
+        match_count is in {0,1,2,3} with 3 binary models.
+        """
+        results = []
+        for idx, item in enumerate(items):
+            idx_key = str(item.get("index", item.get("choice", item.get("id", idx))))
+            scores = [self._model_scores.get(m, {}).get(idx_key, 0.0) for m in self._model_names]
+
+                              mc = sum(1 for s in scores if s > 0.5)
+        results.append((mc, scores, idx))
+    return results
+    def fit(self, items: List[Dict[str, Any]], **kwargs) -> "DiscriminabilitySampler":
+        self._load_model_scores()
+        self._items = list(items)
+        self._match_data = self._match_counts(self._items)
+        self._n_models = len(self._model_names) if self._model_names else 1
+        n_items = len(items)
+        if n_items > 0:
+            self._n_per_stratum = max(1, self.target_size // 4)
+            leftover = self.target_size - (self._n_per_stratum * 4)
+            if leftover > 0:
+                self._n_per_stratum = self._n_per_stratum + leftover // 4
+        else:
+            self._n_per_stratum = 0
         return self
-
-    def _score_components(self, items: Sequence[dict]) -> np.ndarray:
-        rows_per_item = [self._score_rows[i] if i < len(self._score_rows) else {} for i in range(len(items))]
-        target_size = self.target_size
-        n = len(items)
-        if n == 0:
-            return np.array([], dtype=np.float32)
-        if target_size >= n:
-            return np.ones(n, dtype=np.float32)
-        keep_per = max(1, int(np.ceil(0.1 * n)))
-        components = np.zeros(n, dtype=np.float32)
-        scores_matrix = self._pairwise_score_matrix(items)
-        disc_values = self._discriminative_values(items, scores_matrix)
-        top_k_by_disc = max(keep_per, int(np.ceil(0.05 * n)))
-        top_indices = np.argsort(disc_values)[::-1][:top_k_by_disc]
-        components[top_indices] = np.maximum(components[top_indices], disc_values[top_indices])
-        model_rows = self._score_rows
-        if model_rows:
-            model_scores = {}
-            for entry in model_rows:
-                model_name = entry.get("model", entry.get("model_name", ""))
-                scores_dict = entry.get("scores", {})
-                model_scores[model_name] = scores_dict
-            if model_scores:
-                model_names = sorted(model_scores.keys())
-                num_models = len(model_names)
-                for i, item in enumerate(items):
-                    content = item.get("query", item.get("input", item.get("text", "")))
-                    content_hash = hash(str(content)[:100])
-                    model_vals_i = []
-                    for model_name in model_names:
-                        all_scores = model_scores[model_name]
-                        if content_hash in all_scores:
-                            model_vals_i.append(all_scores[content_hash])
-                        elif i < len(all_scores):
-                            model_vals_i.append(all_scores[i])
-                        else:
-                            model_vals_i.append(0.5)
-                    max_model = max(model_vals_i)
-                    min_model = min(model_vals_i)
-                    spread = max_model - min_model
-                    if spread > 0 and max_model > 0:
-                        components[i] += spread * max_model
-        if np.any(components):
-            components = components / (np.max(components) + 1e-9)
-        components = np.clip(components, 0.0, 1.0)
-        top_indices = np.argsort(components)[::-1]
-        for idx in top_indices[:keep_per]:
-            components[idx] = max(components[idx], 0.2)
-        return components
 
     def __call__(
         self,
         items: Optional[Iterable[Dict[str, Any]]] = None,
         target_size: Optional[int] = None,
+        dataset: str = "generic",
         **kwargs,
     ) -> List[Dict[str, Any]]:
-        if items is None:
-            if self.data_path is None or not os.path.exists(str(self.data_path)):
-                raise ValueError("DiscriminabilitySampler requires data_path if items is not provided.")
-            build_tokens = str(self.data_path)
-            items_list = self._load_sample_rows(build_tokens)
-        else:
-            items_list = list(items)
+        items_list = list(items) if items is not None else list(self._items)
         if not items_list:
             return []
-        target = target_size if target_size is not None else self.target_size
-        N = len(items_list)
-        if target >= N:
-            return items_list[:]
-        if not hasattr(self, "_score_rows"):
+        if not hasattr(self, "_match_data"):
             self.fit(items_list)
-        components = self._score_components(items_list)
-        if isinstance(components, (list, tuple)):
-            components = np.array(components, dtype=np.float32)
-        probs = np.asarray(components, dtype=np.float32)
-        probs = probs / (probs.sum() + 1e-9)
-        selected_indices = np.sort(
-            np.random.choice(N, size=target, replace=False, p=probs)
-        )
-        return [items_list[int(i)] for i in selected_indices]
+        tgt = target_size if target_size is not None else self.target_size
+        n_per = max(1, tgt // 4)
+        leftover = tgt - (n_per * 4)
+        extra = leftover
+        # Route meta extractor by dataset tag
+        if "lcb" in dataset.lower() or "livecode" in dataset.lower():
+            meta_fn = self._lcb_meta
+        elif "aalcr" in dataset.lower() or "aa" in dataset.lower():
+            meta_fn = self._aalcr_meta
+        else:
+            meta_fn = self._generic_meta
+        # Build strata: stratum_id -> [(item_idx, meta_dict)]
+        strata: Dict[int, List[Tuple[int, Dict[str, float]]]] = defaultdict(list)
+        for mc, scores, idx in self._match_data:
+            strata[mc].append((idx, meta_fn(items_list[idx])))
+        # Select from each stratum by metadata
+        selected: List[int] = []
+        for mc in [0, 1, 2, 3]:
+            bucket = strata.get(mc, [])
+            if not bucket:
+                continue
+            n_take = n_per + (1 if mc < extra else 0)
+            n_take = min(n_take, len(bucket))
+            if n_take == len(bucket):
+                selected.extend([i for i, _ in bucket])
+                continue
+            # LCB: sort by gen_length desc, then by failure-mode diversity
+            # AA-LCR: sort by judge_reasoning_len desc, then by confidence
+            # Both are deterministic and metadata-driven
+            relates_to_lcb = ("lcb" in dataset.lower())
+            if relates_to_lcb:
+                bucket_sorted = sorted(bucket, key=lambda x: (
+                    -x[1].get("gen_length", 0),
+                    -x[1].get("failure_timeout", 0),
+                    -x[1].get("failure_syntax", 0),
+                ))
+            else:
+                bucket_sorted = sorted(bucket, key=lambda x: (
+                    -x[1].get("judge_reasoning_len", 0),
+                    -x[1].get("judge_confidence", 0),
+                    -x[1].get("judge_logprob", 0),
+                ))
+            selected.extend([i for i, _ in bucket_sorted[:n_take]])
+        selected = sorted(set(selected))
+        return [items_list[i] for i in selected if i < len(items_list)]
