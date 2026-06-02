@@ -16,9 +16,8 @@ This package provides two data-driven benchmark pruning samplers:
 ## Installation
 
 ```bash
-# dependencies: numpy, evalscope
-uv add numpy evalscope
-uv add .
+# dependencies are listed in pyproject.toml
+uv sync
 ```
 
 ## Usage - Part A (DiscriminabilitySampler)
