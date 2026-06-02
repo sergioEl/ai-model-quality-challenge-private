@@ -252,10 +252,9 @@ with gr.Blocks() as app:
                 file_types=[".xlsx"]
             )
         with gr.Column(scale=2):
-            comparer = gr.Dropdown(
+            comparer = gr.CheckboxGroup(
                 choices=known_models,
                 value=known_models,
-                multiselect=True,
                 label="Active Models to Compare"
             )
             
