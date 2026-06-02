@@ -103,3 +103,25 @@ evalscope_pruners/
 ## LICENSE
 
 MIT.
+
+## Pinned EvalScope Commit
+
+**Development base:** modelscope/evalscope@`c5573e240744db9ea9d6a696893b844f4a7d8953`
+
+This version was current as of June 2026. If the EvalScope Sampler interface changes,
+verify that your target base exposes a concrete `Sampler` ABC in `evalscope.collections`
+or equivalent, and adapt the subclass signatures accordingly.
+
+## Handouts
+
+### Handout A -- Technical Methodology
+
+The repository includes a one-page technical handout explaining the mathematical
+rationale behind the two pruning samplers, the forbidden baselines and why they
+underperform, and the expected impact on model evaluation fidelity. See
+`handouts/handout_a_technical.md`.
+
+### Handout B -- Mixed-Audience Brief
+
+A half-page overview of the pruner's value proposition targeted at both
+technical and non-technical stakeholders. See `handouts/handout_b_impact.md`.
