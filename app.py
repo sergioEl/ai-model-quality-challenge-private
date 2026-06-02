@@ -9,19 +9,14 @@ import re
 # ==========================================
 
 def resolve_column(columns, exact_target, fallback_keywords):
-    """
-    Intelligently finds a column in the DataFrame. 
-    Prevents KeyErrors if an Excel file has slightly altered column names.
-    """
+    """Intelligently finds a column in the DataFrame."""
     if exact_target in columns:
         return exact_target
     
-    # Search for fallback keywords (case-insensitive)
     for col in columns:
         if all(kw.lower() in str(col).lower() for kw in fallback_keywords):
             return col
             
-    # Absolute fallback to prevent crashes: return the last column (often a metric)
     return columns[-1] if len(columns) > 0 else exact_target
 
 # ==========================================
@@ -29,14 +24,11 @@ def resolve_column(columns, exact_target, fallback_keywords):
 # ==========================================
 
 def parse_perf_sweep(file_path):
-    """
-    Parses a single Excel performance sweep dynamically.
-    Extracts the model identification string from the file architecture.
-    """
+    """Parses a single Excel performance sweep dynamically."""
     try:
         df = pd.read_excel(file_path)
         
-        # Hardened Whitespace Normalization: converts newlines, tabs, and double spaces to a single space
+        # Hardened Whitespace Normalization
         df.columns = [" ".join(str(col).split()) for col in df.columns]
         
         # Dynamic model resolution from filename
@@ -46,7 +38,6 @@ def parse_perf_sweep(file_path):
             match = re.match(r"([A-Za-z0-9\s-]+) profile", base_name)
             
         model_id = match.group(1).strip() if match else base_name.split(".")[0]
-        
         df["Model_ID"] = model_id
         return df
     except Exception as e:
@@ -54,7 +45,7 @@ def parse_perf_sweep(file_path):
         return pd.DataFrame()
 
 def initialize_default_dataset(directory="perf_data"):
-    """Pre-loads initial performance sweeps if present in the local directory."""
+    """Pre-loads initial performance sweeps if present."""
     if not os.path.exists(directory):
         return pd.DataFrame()
     files = glob.glob(os.path.join(directory, "**/*.xlsx"), recursive=True)
@@ -99,7 +90,6 @@ def update_customer_analytics(df, selected_models, target_input, target_output):
     
     filtered = df[df["Model_ID"].isin(selected_models)]
     
-    # Resolve columns safely
     input_col = resolve_column(filtered.columns, "Input Length", ["input"])
     output_col = resolve_column(filtered.columns, "Output Length", ["output"])
     tp_col = resolve_column(filtered.columns, "Throughput (t/s)", ["throughput", "t/s"])
@@ -107,7 +97,6 @@ def update_customer_analytics(df, selected_models, target_input, target_output):
     gen_col = resolve_column(filtered.columns, "Gen Speed (t/s/user)", ["gen", "speed"])
     rpm_col = resolve_column(filtered.columns, "RPM", ["rpm"])
 
-    # Filter for workload parameters
     if input_col in filtered.columns and output_col in filtered.columns:
         exact_match = filtered[
             (pd.to_numeric(filtered[input_col], errors='coerce').fillna(0) >= target_input) & 
@@ -118,17 +107,18 @@ def update_customer_analytics(df, selected_models, target_input, target_output):
 
     summary_data = []
     for model in selected_models:
-        m_df = filtered[filtered["Model_ID"] == model]
+        # Create a clean copy to avoid SettingWithCopyWarning
+        m_df = filtered[filtered["Model_ID"] == model].copy()
         if m_df.empty:
             continue
             
-        # Ensure the target column is numeric before finding max to avoid errors
         m_df[tp_col] = pd.to_numeric(m_df[tp_col], errors='coerce')
-        best_idx = m_df[tp_col].idxmax()
         
-        if pd.isna(best_idx):
-            continue # Skip if all values are NaN
+        # FIX: Check if the column is entirely NaN before trying to find the max index
+        if m_df[tp_col].isna().all():
+            continue 
             
+        best_idx = m_df[tp_col].idxmax()
         best_row = m_df.loc[best_idx]
         
         summary_data.append({
@@ -164,14 +154,13 @@ def update_engineer_analytics(df, selected_models):
     if df.empty or not selected_models:
         return pd.DataFrame(), None, None
         
-    filtered = df[df["Model_ID"].isin(selected_models)]
+    # Use .copy() to prevent SettingWithCopyWarnings when modifying dtypes
+    filtered = df[df["Model_ID"].isin(selected_models)].copy()
     
-    # Resolve columns safely
     batch_col = resolve_column(filtered.columns, "Batch Size", ["batch"])
     tp_col = resolve_column(filtered.columns, "Throughput (t/s)", ["throughput", "t/s"])
     hardware_col = resolve_column(filtered.columns, "Throughput / box (t/s/hardware)", ["box", "hardware"])
     
-    # Ensure numeric types for plotting
     for col in [batch_col, tp_col, hardware_col]:
         if col in filtered.columns:
             filtered[col] = pd.to_numeric(filtered[col], errors='coerce')
@@ -188,7 +177,6 @@ def update_engineer_analytics(df, selected_models):
         tooltip=["Model_ID", batch_col, hardware_col]
     )
     
-    # Clean UI Table Output
     core_cols = ["Model_ID", batch_col, "Cache %", tp_col, "TTFT (ms)", "RPM", "Max number of milliseconds"]
     existing_cols = [c for c in core_cols if c in filtered.columns]
     remaining_cols = [c for c in filtered.columns if c not in existing_cols]
@@ -199,7 +187,8 @@ def update_engineer_analytics(df, selected_models):
 # 3. Gradio Interface Layout
 # ==========================================
 
-with gr.Blocks(theme=gr.themes.Soft(primary_hue="orange", secondary_hue="slate")) as app:
+# FIX: Removed the theme argument from gr.Blocks() for Gradio 6.0 compatibility
+with gr.Blocks() as app:
     gr.Markdown("# 🚀 Cerebras Performance Analytics Lab\n*Transforming complex hardware projection metrics into clear runtime decisions.*")
     
     initial_dataset = initialize_default_dataset()
@@ -267,4 +256,9 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="orange", secondary_hue="slate")
             )
 
 if __name__ == "__main__":
-    app.launch(server_name="0.0.0.0", server_port=7860)
+    # FIX: Moved the theme assignment down here to the launch method
+    app.launch(
+        server_name="0.0.0.0", 
+        server_port=7860,
+        theme=gr.themes.Soft(primary_hue="orange", secondary_hue="slate")
+    )
