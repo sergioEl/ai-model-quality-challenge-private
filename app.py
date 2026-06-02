@@ -179,13 +179,19 @@ def update_customer_analytics(df, selected_models, target_input, target_output):
         verdict += f"- **{row['Model']}**: Delivers a peak generation performance of **{row['User Gen Speed (t/s)']:.1f} t/s per user** with a Time-to-First-Token latency of **{row['Optimal TTFT (ms)']:.1f} ms**. Sustains up to **{row['Requests/Min (RPM)']} RPM**.\n"
 
     plot_throughput = gr.BarPlot(
-        summary_df, x="Model", y="Max Total Throughput (t/s)", 
-        title="Sustained Cluster Throughput Capacity (Tokens/Second)", color="Model", vertical=False
+        summary_df, 
+        x="Max Total Throughput (t/s)", 
+        y="Model", 
+        title="Sustained Cluster Throughput Capacity (Tokens/Second)", 
+        color="Model"
     )
     
     plot_ttft = gr.BarPlot(
-        summary_df, x="Model", y="Optimal TTFT (ms)", 
-        title="Responsiveness Profile: Lower is Better (TTFT in ms)", color="Model", vertical=False
+        summary_df, 
+        x="Optimal TTFT (ms)", 
+        y="Model", 
+        title="Responsiveness Profile: Lower is Better (TTFT in ms)", 
+        color="Model"
     )
     
     return verdict, plot_throughput, plot_ttft
