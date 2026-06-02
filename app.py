@@ -277,8 +277,8 @@ with gr.Blocks() as app:
             insights_box = gr.Markdown("*Click evaluation button to run comparative analysis.*")
             
             with gr.Row():
-                chart_cust_1 = gr.Plot(label="Total Sizing Capacity")
-                chart_cust_2 = gr.Plot(label="User Experience Latency")
+                chart_cust_1 = gr.BarPlot(label="Total Sizing Capacity")
+                chart_cust_2 = gr.BarPlot(label="User Experience Latency")
                 
             trigger_customer.click(
                 fn=update_customer_analytics,
@@ -292,8 +292,8 @@ with gr.Blocks() as app:
             trigger_engineer = gr.Button("Generate Deep Investigation Matrix", variant="secondary")
             
             with gr.Row():
-                chart_eng_1 = gr.Plot(label="Sustained Saturation Curve")
-                chart_eng_2 = gr.Plot(label="Hardware Multi-Node Scaling Quotient")
+                chart_eng_1 = gr.LinePlot(label="Sustained Saturation Curve")
+                chart_eng_2 = gr.LinePlot(label="Hardware Multi-Node Scaling Quotient")
                 
             gr.Markdown("#### Complete Raw Engineering Log")
             data_matrix = gr.DataFrame(interactive=False, wrap=True)
