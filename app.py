@@ -254,7 +254,7 @@ with gr.Blocks() as app:
         with gr.Column(scale=2):
             comparer = gr.Dropdown(
                 choices=known_models,
-                value=known_models[:3] if len(known_models) >= 3 else known_models,
+                value=known_models,
                 multiselect=True,
                 label="Active Models to Compare"
             )
