@@ -110,8 +110,8 @@ def update_customer_analytics(df, selected_models, target_input, target_output):
     # Filter for workload parameters
     if input_col in filtered.columns and output_col in filtered.columns:
         exact_match = filtered[
-            pd.to_numeric(filtered[input_col], errors='coerce').fillna(0) >= target_input & 
-            pd.to_numeric(filtered[output_col], errors='coerce').fillna(0) >= target_output
+            (pd.to_numeric(filtered[input_col], errors='coerce').fillna(0) >= target_input) & 
+            (pd.to_numeric(filtered[output_col], errors='coerce').fillna(0) >= target_output)
         ]
         if not exact_match.empty:
             filtered = exact_match
