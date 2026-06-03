@@ -189,6 +189,8 @@ class DiscriminabilitySampler(Sampler):
         dataset: str = "generic",
         **kwargs,
     ) -> List[Dict[str, Any]]:
+        if items is None and not hasattr(self, "_items") and self.data_path:
+            items = self._load_predictions()
         items_list = list(items) if items is not None else list(self._items)
         if not items_list:
             return []
