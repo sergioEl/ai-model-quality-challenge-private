@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
-from evalscope.collections import Sampler
+from evalscope_pruners.base import Sampler
 
 
 class DiscriminabilitySampler(Sampler):
