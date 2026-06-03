@@ -44,9 +44,9 @@ class ImageStressSampler(Sampler):
         if mmmu_dir.is_file():
             paths = [mmmu_dir]
         else:
-            paths = sorted(mmmu_dir.glob("*.jsonl"))
+            paths = sorted(mmmu_dir.rglob("*.jsonl"))
         if not paths:
-            paths = sorted(mmmu_dir.glob("*.json"))
+            paths = sorted(mmmu_dir.rglob("*.json"))
         for p in paths:
             suffix = p.suffix.lower()
             if suffix in (".jsonl",):
