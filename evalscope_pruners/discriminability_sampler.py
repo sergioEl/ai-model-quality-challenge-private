@@ -7,6 +7,8 @@ Fixes from code review:
      and failure-mode diversity instead of variance (identical for all samples
      in 1-pass and 2-pass strata with binary scores).
   3. No random fallback: all selection is deterministic from embedded metadata.
+  4. Full quota redistribution: unused slots from sparse strata are reassigned
+     to strata that still have remaining items (priority: mc=1,2 then mc=0,3).
 """
 import json
 import os
@@ -166,20 +168,12 @@ class DiscriminabilitySampler(Sampler):
             mc = sum(1 for s in scores if s > 0.5)
             results.append((mc, scores, idx))
         return results
-        
+
     def fit(self, items: List[Dict[str, Any]], **kwargs) -> "DiscriminabilitySampler":
         self._load_model_scores()
         self._items = list(items)
         self._match_data = self._match_counts(self._items)
         self._n_models = len(self._model_names) if self._model_names else 1
-        n_items = len(items)
-        if n_items > 0:
-            self._n_per_stratum = max(1, self.target_size // 4)
-            leftover = self.target_size - (self._n_per_stratum * 4)
-            if leftover > 0:
-                self._n_per_stratum = self._n_per_stratum + leftover // 4
-        else:
-            self._n_per_stratum = 0
         return self
 
     def __call__(
@@ -196,10 +190,11 @@ class DiscriminabilitySampler(Sampler):
             return []
         if not hasattr(self, "_match_data"):
             self.fit(items_list)
+
         tgt = target_size if target_size is not None else self.target_size
         n_per = max(1, tgt // 4)
         leftover = tgt - (n_per * 4)
-        extra = leftover
+
         # Route meta extractor by dataset tag
         if "lcb" in dataset.lower() or "livecode" in dataset.lower():
             meta_fn = self._lcb_meta
@@ -207,37 +202,65 @@ class DiscriminabilitySampler(Sampler):
             meta_fn = self._aalcr_meta
         else:
             meta_fn = self._generic_meta
-        # Build strata: stratum_id -> [(item_idx, meta_dict)]
-        strata: Dict[int, List[Tuple[int, Dict[str, float]]]] = defaultdict(list)
-        for mc, scores, idx in self._match_data:
-            strata[mc].append((idx, meta_fn(items_list[idx])))
-        # Select from each stratum by metadata
-        selected: List[int] = []
-        for mc in [0, 1, 2, 3]:
-            bucket = strata.get(mc, [])
-            if not bucket:
-                continue
-            n_take = n_per + (1 if mc < extra else 0)
-            n_take = min(n_take, len(bucket))
-            if n_take == len(bucket):
-                selected.extend([i for i, _ in bucket])
-                continue
-            # LCB: sort by gen_length desc, then by failure-mode diversity
-            # AA-LCR: sort by judge_reasoning_len desc, then by confidence
-            # Both are deterministic and metadata-driven
-            relates_to_lcb = ("lcb" in dataset.lower())
+
+        relates_to_lcb = ("lcb" in dataset.lower() or "livecode" in dataset.lower())
+
+        def sort_bucket(bucket):
             if relates_to_lcb:
-                bucket_sorted = sorted(bucket, key=lambda x: (
+                return sorted(bucket, key=lambda x: (
                     -x[1].get("gen_length", 0),
                     -x[1].get("failure_timeout", 0),
                     -x[1].get("failure_syntax", 0),
                 ))
             else:
-                bucket_sorted = sorted(bucket, key=lambda x: (
+                return sorted(bucket, key=lambda x: (
                     -x[1].get("judge_reasoning_len", 0),
                     -x[1].get("judge_confidence", 0),
                     -x[1].get("judge_logprob", 0),
                 ))
-            selected.extend([i for i, _ in bucket_sorted[:n_take]])
+
+        # Build strata: stratum_id -> [(item_idx, meta_dict)]
+        strata: Dict[int, List[Tuple[int, Dict[str, float]]]] = defaultdict(list)
+        for mc, scores, idx in self._match_data:
+            strata[mc].append((idx, meta_fn(items_list[idx])))
+
+        # Pre-sort each stratum
+        sorted_strata: Dict[int, List[Tuple[int, Dict[str, float]]]] = {}
+        for mc in [0, 1, 2, 3]:
+            bucket = strata.get(mc, [])
+            sorted_strata[mc] = sort_bucket(bucket)
+
+        # --- Pass 1: allocate base quota per stratum ---
+        # Each stratum gets n_per slots; mc=0..leftover-1 get one extra slot.
+        taken_per_stratum: Dict[int, List[int]] = {mc: [] for mc in [0, 1, 2, 3]}
+        remaining_per_stratum: Dict[int, List[Tuple[int, Dict[str, float]]]] = {}
+        unused_quota = 0  # slots not used due to sparse strata
+
+        for mc in [0, 1, 2, 3]:
+            bucket = sorted_strata[mc]
+            n_take = n_per + (1 if mc < leftover else 0)
+            actual_take = min(n_take, len(bucket))
+            unused_quota += n_take - actual_take
+            taken_per_stratum[mc] = [i for i, _ in bucket[:actual_take]]
+            remaining_per_stratum[mc] = bucket[actual_take:]
+
+        # --- Pass 2: redistribute unused quota ---
+        # Priority order: strata 1 and 2 (most discriminative) first, then 0, then 3.
+        if unused_quota > 0:
+            for mc in [1, 2, 0, 3]:
+                if unused_quota <= 0:
+                    break
+                rem = remaining_per_stratum.get(mc, [])
+                if not rem:
+                    continue
+                take = min(unused_quota, len(rem))
+                taken_per_stratum[mc].extend([i for i, _ in rem[:take]])
+                remaining_per_stratum[mc] = rem[take:]
+                unused_quota -= take
+
+        # Combine and return
+        selected: List[int] = []
+        for mc in [0, 1, 2, 3]:
+            selected.extend(taken_per_stratum[mc])
         selected = sorted(set(selected))
         return [items_list[i] for i in selected if i < len(items_list)]
