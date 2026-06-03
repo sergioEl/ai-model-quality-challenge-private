@@ -77,10 +77,10 @@ class DiscriminabilitySampler(Sampler):
         return items
 
     def _load_model_scores(self) -> None:
-        if not self.results_dir or not os.path.isdir(self.results_dir):
+        if not self.results_dir:
             return
-        for model_dir in os.listdir(self.results_dir):
-            model_path = os.path.join(self.results_dir, model_dir)
+        for _rdir, model_dir in [(r, m) for r in [d.strip() for d in self.results_dir.split(",") if d.strip() and os.path.isdir(d.strip())] for m in os.listdir(r)]:
+            model_path = os.path.join(_rdir, model_dir)
             if not os.path.isdir(model_path):
                 continue
             for subdir in os.listdir(model_path):
