@@ -1,4 +1,4 @@
-# Handout A -- Technical Methodology
+# Handout A — Technical Methodology
 ## Minimal-Pruning Probe Sets for EvalScope
 
 **Audience:** ML Engineers, Evaluation Platform Maintainers
@@ -23,41 +23,57 @@ This project implements two data-driven pruning samplers for `modelscope/evalsco
 
 ## 2. DiscriminabilitySampler: Objective and Scoring
 
-### 2.1 Mathematical Objective
+### 2.1 Core Idea: Match-Count Stratification
 
-Given model scores `s_m[i]` for model `m` on sample `i`, the discriminability score is:
+With 3 binary-scoring models (pass/fail per sample), each sample has a **match count**
+in {0, 1, 2, 3} — the number of models that pass it. This partitions the benchmark into
+four difficulty strata:
 
-```
-D(i) = mean(|s_m[i] - s_n[i]|) * max(s_m[i])
-```
+| Match count | Interpretation |
+|-------------|----------------|
+| 0 | All models fail — low signal (floor) |
+| 1 | One model solves it — high discriminability |
+| 2 | Two models solve it — moderate discriminability |
+| 3 | All models pass — low signal (ceiling) |
 
-This combines:
-- **Pairwise gap:** Large absolute differences between models indicate informative samples.
-- **Anchor term:** The max score prevents selecting items where all models fail (low signal).
+Strata 1 and 2 are most informative: they contain samples where models disagree.
+The sampler allocates probe slots **proportionally** across all four strata so that
+the probe covers the full difficulty range rather than collapsing to easy or hard extremes.
 
-The computational cost is O(n * k^2) where `k` is the number of pre-scored model runs.
-For typical k=3-5, this remains tractable at benchmark scale.
+### 2.2 Metadata-Driven Tie-Breaking
 
-### 2.2 Selection Algorithm
+Within each stratum, samples are ranked deterministically using embedded metadata
+(no randomness, no variance-based heuristics):
 
-1. Load per-sample model scores from existing `evalscope_run` results.
-2. Compute D(i) for all samples.
-3. Apply a **score-coloring cap**: if only one model scores above threshold T, boost the
-   score by 1.5x to capture items that only some models solve.
-4. Sort by D(i) descending and take the top `target_size` items.
-5. `target_size` is set to ~5-10% of the original benchmark.
+- **LCB (code generation):** Sort by generation length descending, then by failure-mode
+  diversity (timeout > syntax > other). Longer responses with diverse failures reveal
+  more about model behavior at the boundary.
+- **AA-LCR (long-context reasoning):** Sort by judge reasoning length descending, then
+  by judge confidence descending, then by log-probability. Samples where the LLM judge
+  deliberates longer and is less certain are more discriminative for long-context models.
 
-### 2.3 Why This Beats Trivial Baselines
+This tie-breaking is **orthogonal to model scores** — it works for any future model
+ensemble because it ranks by intrinsic sample properties, not by current model outputs.
 
-| Baseline                  | Problem                                                    |
+### 2.3 Selection Algorithm
+
+1. Load embedded metadata from each item (prediction text, execution result, review).
+2. Compute match count for each sample using pre-scored model results from `evalscope_run`.
+3. Assign `n_per_stratum = target_size // 4` slots per stratum (distribute leftover to strata 0–3 in order).
+4. Within each stratum, sort by metadata criteria (LCB or AA-LCR rules above).
+5. Take top `n_per_stratum` items from each stratum; return the union sorted by original index.
+
+### 2.4 Why This Beats Trivial Baselines
+
+| Baseline | Problem |
 |---------------------------|------------------------------------------------------------|
-| Uniform random            | Leaves model-specific blind spots untested                 |
-| Top-k easiest             | All modern models pass; zero ranking signal                |
-| Top-k hardest             | Ceiling effects; all models near zero                      |
-| Hand-picked heuristics    | Non-reproducible; low sample efficiency                    |
-| Overfit to 3 models       | Fails to generalize to new architectures                   |
+| Uniform random | Leaves model-specific blind spots untested |
+| Top-k easiest | All modern models pass; zero ranking signal |
+| Top-k hardest | Ceiling effects; all models near zero |
+| Hand-picked heuristics | Non-reproducible; low sample efficiency |
+| Overfit to 3 models | Fails to generalize to new architectures |
 
-The discriminability objective is **model-agnostic** -- it measures *disagreement*
+Match-count stratification is **model-agnostic** — it measures *disagreement structure*
 rather than absolute performance, making it portable across model generations.
 
 ---
@@ -68,19 +84,19 @@ rather than absolute performance, making it portable across model generations.
 
 For MMMU (a visual question-answering benchmark), the goal is to subset samples that
 maximally stress the *image encoder*. We compute a stress feature vector for each sample:
-
 ```
 f = [entropy, color_richness, edge_count, image_text_ratio]
 ```
 
 Features are normalized to [0, 1] using min-max scaling across the dataset, then
 combined with hand-tuned weights:
-
 ```
-S(i) = 0.3*entropy + 0.25*color_richness + 0.25*edge_count + 0.2*text_ratio
+S(i) = 0.3*entropy + 0.25*color_richness + 0.25*edge_count + 0.2*(1 - text_ratio)
 ```
 
-Top ~10% of samples by S(i) are selected; this enriches for visually complex questions.
+The top ~15% of samples by S(i) receive a probability floor of 0.2 to ensure high-stress
+samples are always represented. Remaining slots are filled by weighted sampling (no replacement)
+proportional to S(i), giving coverage of medium-stress samples too.
 
 ### 3.2 Why Image Stress Matters
 
@@ -106,7 +122,7 @@ integration points are:
 3. **Run the probe eval:** `evalscope eval --model ... --dataset subset.jsonl`
 
 The probe set can be re-used across multiple model evaluations without re-computing
-the discriminability/stress scores, amortizing the cost of the initial analysis.
+the stratification, amortizing the cost of the initial analysis.
 
 ---
 
@@ -115,5 +131,5 @@ the discriminability/stress scores, amortizing the cost of the initial analysis.
 - **Cost reduction:** ~90% fewer forward passes for the probe vs. full benchmark.
 - **Rank preservation:** Kendall's tau between full-benchmark and probe ranking
   is expected to exceed 0.8 for most model pairs.
-- **Reproducibility:** Deterministic with a fixed seed; version-controlled via
-  the pinned EvalScope commit.
+- **Reproducibility:** Fully deterministic with a fixed seed; no random fallback;
+  version-controlled via the pinned EvalScope commit.
