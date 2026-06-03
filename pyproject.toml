@@ -6,11 +6,14 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "datasets>=4.8.5",
-    "evalscope>=0.16.3",
     "gradio>=6.15.2",
     "numpy>=2.4.6",
     "openpyxl>=3.1.5",
     "pandas>=3.0.3",
     "pillow>=12.2.0",
     "torch>=2.4.0",
+    "evalscope>=0.16.3",
 ]
+
+[tool.uv.sources]
+evalscope = { git = "https://github.com/sergioEl/evalscope.git", branch = "main" }
