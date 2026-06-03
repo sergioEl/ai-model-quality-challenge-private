@@ -45,10 +45,12 @@ python run_pruners.py part_a \
   --output results/part_a_subset.json
 ```
 
-**Selection criterion (summary)**
-- Samples where models disagree and at least one model scores high are preferred.
-- An O(n^2) pairwise discriminative score identifies samples with the largest between-model gaps.
-- Top-half scores are boosted to guarantee coverage of the most informative items.
+**Selection criterion — DiscriminabilitySampler**
+- Computes a **match count** (0–3) for each sample: how many of the 3 binary-scored models pass it.
+- Partitions samples into four strata (match count 0, 1, 2, 3).
+- Allocates `n_per_stratum = target_size // 4` slots per stratum (leftover distributed to strata 0–3 in order).
+- Within each stratum, ranks samples by metadata heuristics (LCB: generation length then failure-mode diversity; AA-LCR: judge reasoning length then confidence then log-probability).
+- Selects the top `n_per_stratum` items from each stratum; returns the union sorted by original index.
 
 ## Usage - Part B (ImageStressSampler)
 
