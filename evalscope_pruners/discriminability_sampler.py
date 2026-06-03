@@ -163,10 +163,10 @@ class DiscriminabilitySampler(Sampler):
         for idx, item in enumerate(items):
             idx_key = str(item.get("index", item.get("choice", item.get("id", idx))))
             scores = [self._model_scores.get(m, {}).get(idx_key, 0.0) for m in self._model_names]
-
-                              mc = sum(1 for s in scores if s > 0.5)
-        results.append((mc, scores, idx))
-    return results
+            mc = sum(1 for s in scores if s > 0.5)
+            results.append((mc, scores, idx))
+        return results
+        
     def fit(self, items: List[Dict[str, Any]], **kwargs) -> "DiscriminabilitySampler":
         self._load_model_scores()
         self._items = list(items)
