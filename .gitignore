@@ -1,3 +1,4 @@
 sandbox.md
 *.pyc
 /Evals/MMMU
+/perf_data

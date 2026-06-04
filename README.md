@@ -33,7 +33,12 @@ cd ai-model-quality-challenge
 uv sync
 ```
 
-### 4. launch the app
+### 4. Extract the sample data
+```bash
+unzip perf_data.zip -d ./perf_data
+```
+
+### 5. launch the app
 ```bash
 uv run app.py
 ```
@@ -45,8 +50,8 @@ The app will launch locally. Open your browser and navigate to http://127.0.0.1:
 ---
 
 📝 A Note on requirements.txt
-You will notice both a uv.lock file and a requirements.txt file in this repository.
+You will notice both a `uv.lock` file and a `requirements.txt` file in this repository.
 
-uv.lock is intended for local developers to guarantee a strict, perfectly reproducible environment.
+`uv.lock` is intended for local developers to guarantee a strict, perfectly reproducible environment.
 
-requirements.txt contains only the loose, top-level dependencies (pandas, openpyxl, gradio). This is intentionally kept unpinned to allow cloud-hosting 
+`requirements.txt` contains only the loose, top-level dependencies (pandas, openpyxl, gradio). This is intentionally kept unpinned to allow cloud-hosting 
