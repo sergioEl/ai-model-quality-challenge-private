@@ -494,7 +494,7 @@ wheels = [
 [[package]]
 name = "evalscope"
 version = "0.0.0.dev0"
-source = { git = "https://github.com/sergioEl/evalscope.git?branch=main#54ee8e4ee41a99daf8da675421d07e7d31ceedb1" }
+source = { git = "https://github.com/sergioEl/evalscope.git?branch=main#4431645c27a3cc69eebd79593ea18cd4dd0246be" }
 dependencies = [
     { name = "aiohttp" },
     { name = "colorlog" },
