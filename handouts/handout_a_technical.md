@@ -1,173 +1,55 @@
 # Handout A — Technical Methodology
+
 ## Minimal-Pruning Probe Sets for EvalScope
 
-**Audience:** ML Engineers, Evaluation Platform Maintainers
-**Length:** 1 page
+**Audience:** ML Engineers, Evaluation Platform Maintainers | **Length:** 1 page
 
----
+## 1. Problem Statement & Approach
 
-## 1. Problem Statement
+Large multimodal and code-generation benchmarks ([LiveCodeBench](https://github.com/sergioEl/evalscope/blob/main/evalscope/benchmarks/live_code_bench/live_code_bench_adapter.py), [AA-LCR](https://github.com/sergioEl/evalscope/blob/main/evalscope/benchmarks/aa_lcr/aa_lcr_adapter.py), MMMU 12K) are prohibitively expensive to run repeatedly during rapid model development. The problem is to construct a *probe set*—a heavily reduced subset that preserves the framework's ability to rank candidate models correctly while drastically cutting inference costs.
 
-Large multimodal and code-generation benchmarks (LCB v5, AA-LCR, MMMU 12K) are expensive
-to run repeatedly during model development. A *probe set* is a reduced subset of the full
-benchmark that preserves the ability to distinguish between candidate models while cutting
-evaluation cost.
+We implemented two distinct, data-driven strategies natively into the `evalscope` pipeline:
 
-This project implements two data-driven pruning samplers for `modelscope/evalscope`:
+* **Part A (DiscriminabilitySampler):** Prunes code and long-context benchmarks using historical model disagreement.
+* **Part B (ImageStressSampler):** Prunes MMMU by isolating visual extraction complexity from LLM reasoning complexity.
 
-- **Part A (DiscriminabilitySampler):** Prunes LCB v5 and AA-LCR to a ~300-item probe.
-- **Part B (ImageStressSampler):** Prunes MMMU into ~1,200 samples that maximally stress
-  the vision encoder **while controlling for LLM reasoning difficulty**.
+## 2. Part A: DiscriminabilitySampler
 
----
+**The Approach:** With three binary-scoring reference models (pass/fail), we use **Match-Count Stratification**. Each sample is grouped into a stratum `{0, 1, 2, 3}` based on how many reference models passed it. Strata 1 and 2 represent the "disagreement zone" where models diverge, offering the highest discriminative signal.
 
-## 2. DiscriminabilitySampler: Objective and Scoring
+To break ties within strata without introducing sampling variance, we rank samples deterministically using embedded metadata:
 
-### 2.1 Core Idea: Match-Count Stratification
+* **LCB:** Sort by generation length (descending) and failure-mode diversity. Longer generations with diverse failures reveal boundary behaviors.
+* **AA-LCR:** Sort by judge reasoning length (descending) and judge confidence. Samples requiring longer LLM judge deliberation are historically denser.
 
-With 3 binary-scoring models (pass/fail per sample), each sample has a **match count**
-in {0, 1, 2, 3} — the number of models that pass it. This partitions the benchmark into
-four difficulty strata:
+**Defense of Pruning Ratio:** We enforce a strict **`prune_ratio: 0.1`** (10%), reducing LCB to ~31 samples, AA-LCR to ~50 (enforcing a statistical floor), and MMMU to ~1,200. This 10% subset is sufficient because standard benchmarks follow a long-tail distribution of difficulty. Up to 60% of most modern benchmarks consist of items all frontier models pass (ceiling) or all models fail (floor). By reallocating the 10% quota proportionally across the strata with an emphasis on the disagreement zone, we capture the exact decision boundaries that cause models to rank differently, discarding the redundant padding.
 
-| Match count | Interpretation |
-|-------------|----------------|
-| 0 | All models fail — low signal (floor) |
-| 1 | One model solves it — high discriminability |
-| 2 | Two models solve it — moderate discriminability |
-| 3 | All models pass — low signal (ceiling) |
+## 3. Part B: ImageStressSampler
 
-Strata 1 and 2 are most informative: they contain samples where models disagree.
-The sampler allocates probe slots **proportionally** across all four strata so that
-the probe covers the full difficulty range rather than collapsing to easy or hard extremes.
+**The Approach:** Standard VQA evaluations suffer from an attribution problem: if a model fails, it could be a weak image encoder *or* a weak LLM backbone. To stress the image encoder specifically, we must target samples where *visual extraction is exceptionally difficult, but the textual reasoning required to answer is trivial* (e.g., dense chart reading, map legends, complex UI tables).
 
-### 2.2 Metadata-Driven Tie-Breaking
+We achieve this mathematically by scoring each [MMMU](https://github.com/sergioEl/evalscope/blob/main/evalscope/benchmarks/mmmu/mmmu_adapter.py) item on a visual complexity index:
+`S(i) = 0.35*edge_count + 0.3*color_richness + 0.25*entropy + 0.1*(1 - text_ratio)`
 
-Within each stratum, samples are ranked deterministically using embedded metadata
-(no randomness, no variance-based heuristics):
+The `(1 - text_ratio)` penalty is critical: it actively down-weights text-heavy questions where a strong LLM backbone could guess the answer without engaging the vision encoder. High entropy and edge density guarantee that quantized or low-resolution encoders will drop spatial details and fail, perfectly isolating the encoder's capability floor.
 
-- **LCB (code generation):** Sort by generation length descending, then by failure-mode
-  diversity (timeout > syntax > other). Longer responses with diverse failures reveal
-  more about model behavior at the boundary.
-- **AA-LCR (long-context reasoning):** Sort by judge reasoning length descending, then
-  by judge confidence descending, then by log-probability. Samples where the LLM judge
-  deliberates longer and is less certain are more discriminative for long-context models.
+## 4. Architecture & Assumptions
 
-This tie-breaking is **orthogonal to model scores** — it works for any future model
-ensemble because it ranks by intrinsic sample properties, not by current model outputs.
+### Native EvalScope Integration
 
-### 2.3 Selection Algorithm
+Instead of relying on clunky offline pre-processing scripts, the pruning logic is injected directly into `evalscope`'s standard execution lifecycle using a [PruningAdapterMixin](https://github.com/sergioEl/evalscope/blob/main/evalscope/api/benchmark/adapters/pruning_mixin.py).
 
-1. Load embedded metadata from each item (prediction text, execution result, review).
-2. Compute match count for each sample using pre-scored model results from `evalscope_run`.
-3. Assign `n_per_stratum = target_size // 4` slots per stratum (distribute leftover to strata 0–3 in order).
-4. Within each stratum, sort by metadata criteria (LCB or AA-LCR rules above).
-5. Take top `n_per_stratum` items from each stratum; redistribute unused quota (Pass 2)
-   to strata with remaining items, priority: mc=1, mc=2, mc=0, mc=3.
-6. Return the union sorted by original index.
+By leveraging Python's Method Resolution Order (MRO), the mixin intercepts the parent adapter's `load_dataset()` call. New benchmark endpoints (e.g., `live_code_bench_pruned`) capture standard CLI `--dataset-args` JSON payloads. The mixin executes the disk-based samplers to calculate the top 10% target indices, mathematically filters the loaded `DatasetDict` in-memory, and passes the lightweight probe set to the evaluator.
 
-### 2.4 Why This Beats Trivial Baselines
+### Core Assumptions
 
-| Baseline | Problem |
-|----------|---------|
-| Uniform random | Leaves model-specific blind spots untested |
-| Top-k easiest | All modern models pass; zero ranking signal |
-| Top-k hardest | Ceiling effects; all models near zero |
-| Hand-picked heuristics | Non-reproducible; low sample efficiency |
-| Overfit to 3 models | Fails to generalize to new architectures |
+* **Distribution:** We assume historical model disagreement on the baseline models (`gpt-oss`, `kimi`, `minimax`) serves as a valid proxy for the general difficulty curve of future, unseen models.
+* **Scale:** We assume a strict 10% slice captures the true variance of the dataset, provided we enforce an absolute minimum floor (e.g., `max(50, target_size)`) to prevent statistical collapse on ultra-small sets like AA-LCR.
 
-Match-count stratification is **model-agnostic** — it measures *disagreement structure*
-rather than absolute performance, making it portable across model generations.
+## 5. Future Optimizations
 
----
+If given additional resources, the pipeline would evolve in three ways:
 
-## 3. ImageStressSampler: Objective and Scoring
-
-### 3.1 The Interface Constraint: Why Encoder Isolation Is Hard
-
-MMU tasks are served through the standard OpenAI multimodal API: image + text prompt in,
-text answer out. This creates an **attribution problem**: when a model answers incorrectly,
-the failure could originate from either:
-
-- **The image encoder** — failed to extract visual features (e.g., missed a legend, misread
-  chart text, lost fine-grained detail in a dense diagram).
-- **The LLM backbone** — extracted features correctly but failed to reason over them.
-
-High-complexity images alone do not solve this. A model can fail a hard diagram question
-because of multi-step reasoning, not because of visual extraction. Selecting only by image
-entropy or edge density would confound encoder quality with reasoning quality.
-
-### 3.2 The Solution: High Visual Extraction Demand, Low Reasoning Demand
-
-To isolate the encoder, we target samples where **visual extraction is the hard part but
-the answer is trivially derivable once the image is read correctly**. If a model still fails
-these items, the failure is strongly attributable to the image encoder rather than general
-reasoning capability.
-
-Concrete example question types that satisfy this criterion:
-
-| Question type | Visual extraction demand | Reasoning demand |
-|---------------|------------------------|------------------|
-| "What is the y-axis label on this chart?" | High (dense chart, small text) | Trivial (read and copy) |
-| "What note is marked on beat 3 of measure 2?" | High (sheet music, fine-grained) | Trivial (locate and name) |
-| "What color is the legend entry for 'Series B'?" | High (map/plot legend) | Trivial (visual lookup) |
-| "Read the value at the intersection of row 3, col 4" | High (table OCR) | Trivial (retrieve) |
-
-These are *perception-bottlenecked* questions: the answer is directly visible in the image
-but requires high-fidelity encoding. A degraded encoder (lower resolution, aggressive
-quantization, pruned patch embeddings) will fail here first.
-
-### 3.3 Mathematical Objective
-
-For MMMU (a visual question-answering benchmark), we subset samples that maximize the
-image-encoder stress signal **while penalizing high text-reasoning load**:
-
-```
-f = [entropy, color_richness, edge_count, image_text_ratio]
-```
-
-Features are normalized to [0,1] using min-max scaling across the dataset, then
-combined with hand-tuned weights:
-
-```
-S(i) = 0.35*edge_count + 0.3*color_richness + 0.25*entropy + 0.1*(1 - text_ratio)
-```
-
-The `(1 - text_ratio)` term **penalizes text-heavy questions** — items where the answer
-can be derived from reading the question text rather than the image. This operationalizes
-the encoder-isolation principle: we down-weight items where LLM backbone reasoning could
-compensate for weak visual extraction.
-
-The top ~15% of samples by S(i) receive a probability floor of 0.2 to ensure high-stress
-samples are always represented. Remaining slots are filled by weighted sampling (no replacement)
-proportional to S(i), giving coverage of medium-stress samples too.
-
-### 3.4 Why This Isolates the Encoder
-
-1. **High edge density** → charts, diagrams, dense figures with fine-grained details that
-   require high-fidelity spatial encoding to read correctly.
-2. **High color richness** → complex visual scenes where color-based discrimination matters
-   (e.g., multi-series plots, labeled maps).
-3. **High entropy** → information-dense images that cannot be summarized by low-frequency
-   features; degraded encoders lose detail first.
-4. **Low text ratio** → the question itself is not answerable without the image, ensuring
-   the model must engage the encoder rather than reason from text alone.
-
-A model with a weaker image encoder will show **systematically lower accuracy** on this
-subset relative to text-only questions — making the probe a direct diagnostic of encoder
-quality under the OpenAI interface constraint.
-
----
-
-## 4. Integration with EvalScope
-
-Both samplers subclass the `Sampler` ABC from `evalscope.collections`. The key
-integration points are:
-
-1. **Run a baseline eval:** `evalscope eval --model ... --dataset lcb_v5` to produce
-   JSONL results with per-sample scores.
-2. **Prune Part A:** `python run_pruners.py part_a --benchmarks data/ --results-dir results/ --target 300`
-3. **Prune Part B:** `python run_pruners.py part_b --mmmu-dir data/mmmu --target 1000`
-4. **Re-evaluate on probe:** Run eval on the pruned subset for fast iteration.
-
-The probe sets are deterministic (fixed seeds), reproducible, and model-agnostic —
-no re-pruning needed when the model ensemble changes.
+* **(a) More Data:** With a massive matrix of historical model responses, we would upgrade from simple Match-Count Stratification to Item Response Theory (IRT). We could calculate continuous latent difficulty and discrimination parameters for every question, building probes optimized mathematically for Fisher Information.
+* **(b) Live Model Endpoint:** We would implement **Active/Dynamic Sampling**. Instead of static offline pruning, the framework would feed strata to the live model iteratively. If the model immediately fails the easiest stratum or aces the hardest, the evaluation halts early with a bounded confidence interval, saving even more compute.
+* **(c) More Time:** For LCB, we would implement Abstract Syntax Tree (AST) analysis during the metadata tie-breaking phase to prioritize coding problems that require high cyclomatic complexity, rather than relying purely on generation string length.
